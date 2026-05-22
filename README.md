@@ -115,9 +115,22 @@ always grants direct human access and bypasses lease checks.
 
 ## Install
 
+**Homebrew (recommended):**
+
+```sh
+brew install parmsam/tap/warden
+```
+
+**Go install:**
+
 ```sh
 go install github.com/parmsam/warden/cmd/warden@latest
 ```
+
+> If `warden` isn't found after `go install`, add Go's bin directory to your PATH:
+> ```sh
+> echo 'export PATH="$PATH:$HOME/go/bin"' >> ~/.zshrc && source ~/.zshrc
+> ```
 
 ## Quick start
 
