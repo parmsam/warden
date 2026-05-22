@@ -1,0 +1,15 @@
+# build outputs
+/warden
+dist/
+
+# database files
+*.db
+*.db-wal
+*.db-shm
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
