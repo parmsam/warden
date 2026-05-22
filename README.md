@@ -163,6 +163,25 @@ warden mcp                             # MCP stdio server only (for Claude Code)
 warden tui                              # browse secrets, audit log, and leases
 ```
 
+## Security model
+
+**What warden protects against:**
+
+- **Secrets at rest** — everything in `~/.warden/warden.db` is age-encrypted; the private key lives in the OS keychain, never on disk in plaintext.
+- **Sprawl** — one vault instead of `.env` files copied across repos, each a potential leak point.
+- **Unaccountable access** — every read is logged with PID, working directory, and git remote. You can always answer *which agent, from which repo, touched which secret at what time.*
+- **Overprivileged agents** — per-agent policies restrict which keys each agent can access from which repo.
+
+**What warden does not protect against:**
+
+Warden hands the decrypted value back to the caller as plaintext — whether that's a human, a shell script, or an MCP tool result landing in an agent's context window. Once the value is in the agent's context, a prompt injection attack (malicious content in a file the agent reads, a poisoned tool result, etc.) could trick the agent into exfiltrating it via a subsequent shell command or HTTP request.
+
+Warden logs that the secret was fetched, but the damage is already done.
+
+**If credential exfiltration is your threat model**, look at proxy-based approaches like [Infisical Agent Vault](https://github.com/Infisical/agent-vault), which uses a MITM proxy so agents receive dummy values and real credentials are injected into outbound HTTP requests in-flight — the agent never sees the real value at all. The tradeoff is significantly more infrastructure (separate server, custom CA cert, proxy config).
+
+**Using both together** is reasonable: warden manages and audits your secrets locally; a proxy broker intercepts outbound requests before credentials touch the agent. They solve adjacent problems.
+
 ## Technical details
 
 | Concern | Approach |
