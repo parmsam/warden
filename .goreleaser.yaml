@@ -1,0 +1,60 @@
+version: 2
+
+builds:
+  - main: ./cmd/warden
+    binary: warden
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      - goos: windows
+        goarch: arm64
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+
+archives:
+  - formats:
+      - tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+
+brews:
+  - name: warden
+    repository:
+      owner: parmsam
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    homepage: https://github.com/parmsam/warden
+    description: Local-first secrets vault for AI coding agents
+    license: MIT
+    test: |
+      system "#{bin}/warden", "--help"
+    install: |
+      bin.install "warden"
+
+release:
+  github:
+    owner: parmsam
+    name: warden
+  draft: false
+  prerelease: auto

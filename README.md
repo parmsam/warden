@@ -130,6 +130,11 @@ warden audit verify                   # recompute hash chain, confirm integrity
   `get` calls on expired leases and support `warden lease revoke <id>`.
 - **Per-agent scoping** — tag a secret as accessible only to specific agent
   names (e.g. `claude`, `cursor`) or repo paths (e.g. `/Users/sam/prod/*`).
+- **Dummy-value substitution** — agents load a `.env.template` with
+  placeholders like `OPENAI_API_KEY=__warden:OPENAI_API_KEY__` instead of real
+  keys. The MCP tool or daemon resolves placeholders at use time, so even if an
+  agent logs its own environment or is compromised by prompt injection, there is
+  nothing real to exfiltrate.
 
 ### Phase 3 — visibility and polish
 

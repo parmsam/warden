@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"filippo.io/age"
@@ -51,7 +52,7 @@ func Init(dbPath string) error {
 }
 
 // Open opens (or creates) the database at dbPath using the given identity.
-// The schema is applied on every open (CREATE TABLE IF NOT EXISTS is idempotent).
+// Schema is applied on every open (idempotent). Migrations run automatically.
 func Open(dbPath string, identity *age.X25519Identity) (*Store, error) {
 	db, err := openDB(dbPath)
 	if err != nil {
@@ -60,6 +61,10 @@ func Open(dbPath string, identity *age.X25519Identity) (*Store, error) {
 	if err := applySchema(db); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("applying schema: %w", err)
+	}
+	if err := migrate(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("running migrations: %w", err)
 	}
 	return &Store{db: db, identity: identity}, nil
 }
@@ -83,17 +88,12 @@ type Store struct {
 	identity *age.X25519Identity
 }
 
-// Close releases the database connection.
-func (s *Store) Close() error {
-	return s.db.Close()
-}
+func (s *Store) Close() error { return s.db.Close() }
 
-// DB returns the underlying *sql.DB so callers (e.g. audit, lease) can share the connection.
-func (s *Store) DB() *sql.DB {
-	return s.db
-}
+// DB returns the underlying *sql.DB so callers (audit, lease, daemon) can share the connection.
+func (s *Store) DB() *sql.DB { return s.db }
 
-// Secret is a metadata-only view of a stored secret (never includes the plaintext value).
+// Secret is a metadata-only view of a stored secret (values are never included).
 type Secret struct {
 	Key            string
 	Description    string
@@ -101,7 +101,7 @@ type Secret struct {
 	LastAccessedAt *time.Time
 }
 
-// Set encrypts value and upserts it under key. Existing values are overwritten.
+// Set encrypts value and upserts it under key.
 func (s *Store) Set(key, value, description string) error {
 	ciphertext, err := s.encrypt(value)
 	if err != nil {
@@ -131,12 +131,10 @@ func (s *Store) Get(key string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("reading secret %q: %w", key, err)
 	}
-
 	value, err := s.decrypt(ciphertext)
 	if err != nil {
 		return "", fmt.Errorf("decrypting secret %q: %w", key, err)
 	}
-
 	if _, err := s.db.Exec(`UPDATE secrets SET last_accessed_at = ? WHERE key = ?`, time.Now().UTC(), key); err != nil {
 		return "", fmt.Errorf("updating last_accessed_at for %q: %w", key, err)
 	}
@@ -166,6 +164,89 @@ func (s *Store) List() ([]Secret, error) {
 		out = append(out, sec)
 	}
 	return out, rows.Err()
+}
+
+// Policy restricts access to a secret by agent name and/or repo path prefix.
+// Empty AgentName or RepoPath fields act as wildcards.
+type Policy struct {
+	ID        int64
+	Key       string
+	AgentName string
+	RepoPath  string
+	CreatedAt time.Time
+}
+
+// AddPolicy creates an access policy for key. Empty agentName or repoPath means "any".
+func (s *Store) AddPolicy(key, agentName, repoPath string) error {
+	_, err := s.db.Exec(`
+		INSERT INTO secret_policies (key, agent_name, repo_path, created_at)
+		VALUES (?, ?, ?, ?)`,
+		key, agentName, repoPath, time.Now().UTC())
+	if err != nil {
+		return fmt.Errorf("adding policy for %q: %w", key, err)
+	}
+	return nil
+}
+
+// RemovePolicy deletes the policy with the given ID.
+func (s *Store) RemovePolicy(id int64) error {
+	res, err := s.db.Exec(`DELETE FROM secret_policies WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("removing policy %d: %w", id, err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("policy %d not found", id)
+	}
+	return nil
+}
+
+// ListPolicies returns all policies, optionally filtered by key (empty = all).
+func (s *Store) ListPolicies(key string) ([]Policy, error) {
+	q := `SELECT id, key, agent_name, repo_path, created_at FROM secret_policies`
+	var args []any
+	if key != "" {
+		q += ` WHERE key = ?`
+		args = append(args, key)
+	}
+	q += ` ORDER BY key, id`
+
+	rows, err := s.db.Query(q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("listing policies: %w", err)
+	}
+	defer rows.Close()
+
+	var out []Policy
+	for rows.Next() {
+		var p Policy
+		if err := rows.Scan(&p.ID, &p.Key, &p.AgentName, &p.RepoPath, &p.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scanning policy: %w", err)
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// CheckPolicy returns true if the caller (agentName, callerCWD) may access key.
+// If no policies are set for key, access is always allowed (open by default).
+// Non-empty RepoPath is matched as a prefix against callerCWD.
+func (s *Store) CheckPolicy(key, agentName, callerCWD string) (bool, error) {
+	policies, err := s.ListPolicies(key)
+	if err != nil {
+		return false, err
+	}
+	if len(policies) == 0 {
+		return true, nil
+	}
+	for _, p := range policies {
+		agentOK := p.AgentName == "" || p.AgentName == agentName
+		repoOK := p.RepoPath == "" || strings.HasPrefix(callerCWD, p.RepoPath)
+		if agentOK && repoOK {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (s *Store) encrypt(plaintext string) ([]byte, error) {
@@ -199,6 +280,16 @@ func openDB(dbPath string) (*sql.DB, error) {
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("opening database: %w", err)
+	}
+	// WAL mode allows concurrent reads alongside daemon writes.
+	for _, pragma := range []string{
+		`PRAGMA journal_mode=WAL`,
+		`PRAGMA busy_timeout=5000`,
+	} {
+		if _, err := db.Exec(pragma); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("setting %q: %w", pragma, err)
+		}
 	}
 	if err := db.Ping(); err != nil {
 		db.Close()
@@ -236,10 +327,29 @@ func applySchema(db *sql.DB) error {
 			entry_json TEXT NOT NULL,
 			hash       TEXT NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS secret_policies (
+			id         INTEGER PRIMARY KEY AUTOINCREMENT,
+			key        TEXT NOT NULL,
+			agent_name TEXT NOT NULL DEFAULT '',
+			repo_path  TEXT NOT NULL DEFAULT '',
+			created_at DATETIME NOT NULL
+		)`,
 	}
 	for _, stmt := range stmts {
 		if _, err := db.Exec(stmt); err != nil {
 			return fmt.Errorf("executing schema statement: %w", err)
+		}
+	}
+	return nil
+}
+
+// migrate applies incremental schema changes that can't use CREATE TABLE IF NOT EXISTS.
+func migrate(db *sql.DB) error {
+	// Phase 2: add revoked_at to leases.
+	// SQLite does not support IF NOT EXISTS for ADD COLUMN; we ignore the duplicate error.
+	if _, err := db.Exec(`ALTER TABLE leases ADD COLUMN revoked_at DATETIME`); err != nil {
+		if !strings.Contains(err.Error(), "duplicate column name") {
+			return fmt.Errorf("adding revoked_at to leases: %w", err)
 		}
 	}
 	return nil
